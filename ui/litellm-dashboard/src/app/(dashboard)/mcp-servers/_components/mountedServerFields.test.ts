@@ -111,6 +111,14 @@ describe("edit root: auth_type gates", () => {
     expect(entra).toContain("token_exchange_profile");
   });
 
+  it("mounts the custom header rows only for custom_headers, on edit and on create", () => {
+    expect(editRoot({ transport: "http", auth_type: "custom_headers" })).toContain("custom_headers");
+    expect(createRoot({ transport: "http", auth_type: "custom_headers" })).toContain("custom_headers");
+    expect(editRoot({ transport: "http", auth_type: "api_key" })).not.toContain("custom_headers");
+    expect(createRoot({ transport: "http", auth_type: "none" })).not.toContain("custom_headers");
+    expect(editRoot({ transport: "stdio", auth_type: "custom_headers" })).not.toContain("custom_headers");
+  });
+
   it("mounts the seven aws credentials only for aws_sigv4", () => {
     expect(sorted(editCreds({ transport: "http", auth_type: "aws_sigv4" }))).toStrictEqual(
       sorted([

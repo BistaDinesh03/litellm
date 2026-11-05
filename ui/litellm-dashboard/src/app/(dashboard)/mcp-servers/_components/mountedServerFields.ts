@@ -97,6 +97,9 @@ const authSubtreeRoot = ({ authType, oauthFlowType, tokenExchangeProfile }: Auth
   if (authType === AUTH_TYPE.OAUTH2_ID_JAG) {
     return ["token_exchange_endpoint", "audience", "subject_token_type"];
   }
+  if (authType === AUTH_TYPE.CUSTOM_HEADERS) {
+    return ["custom_headers"];
+  }
   return [];
 };
 

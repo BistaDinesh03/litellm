@@ -14,7 +14,7 @@ import {
   isClientForwardedTokenMode,
   preservedAdminCredentials,
 } from "@/components/mcp_tools/types";
-import { AUTH_TYPES_REQUIRING_CREDENTIALS, reduceStaticHeaders } from "./createServerPayload";
+import { AUTH_TYPES_REQUIRING_CREDENTIALS, reduceStaticHeaders, withCustomHeaders } from "./createServerPayload";
 import { TOOL_DISPLAY_NAME_PATTERN, normalizeEnvVars } from "./utils";
 
 export type MCPAccessGroupValue = string | { readonly name?: string };
@@ -288,6 +288,7 @@ export const buildEditServerPayload = (values: EditServerFormValues, ui: EditSer
 
   const {
     static_headers: staticHeadersList,
+    custom_headers: customHeadersList,
     env_vars: envVarsList,
     credentials: credentialValues,
     stdio_config: rawStdioConfig,
@@ -308,7 +309,11 @@ export const buildEditServerPayload = (values: EditServerFormValues, ui: EditSer
   );
   const staticHeaders = reduceStaticHeaders(staticHeadersList);
   const envVars = normalizeEnvVars(envVarsList);
-  const credentialsPayload = buildCredentials(credentialValues);
+  const credentialsPayload = withCustomHeaders(
+    buildCredentials(credentialValues),
+    rawRestValues.auth_type,
+    customHeadersList,
+  );
 
   const stdio =
     rawRestValues.transport === "stdio"

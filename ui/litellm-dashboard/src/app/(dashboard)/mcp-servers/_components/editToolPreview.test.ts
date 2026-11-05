@@ -102,4 +102,46 @@ describe("getEditToolPreview", () => {
       expect(getEditToolPreview({ ...saved, transport }, saved)).toEqual({ kind: "saved" });
     }
   });
+
+  describe("custom headers", () => {
+    const savedCustom = { ...saved, auth_type: "custom_headers", static_headers: [] };
+    const rows = [{ header: "DD-API-KEY", value: "rotated-secret" }];
+
+    it("keeps saved discovery while no header rows are entered", () => {
+      expect(getEditToolPreview({ ...savedCustom, custom_headers: [] }, savedCustom)).toEqual({ kind: "saved" });
+    });
+
+    it("previews entered rows as credentials.headers", () => {
+      expect(getEditToolPreview({ ...savedCustom, custom_headers: rows }, savedCustom)).toEqual({
+        kind: "preview",
+        config: {
+          url: "https://example.com/mcp",
+          transport: "http",
+          auth_type: "custom_headers",
+          static_headers: {},
+          credentials: { headers: { "DD-API-KEY": "rotated-secret" } },
+        },
+      });
+    });
+
+    it("needs rows before previewing a switch to custom headers", () => {
+      expect(getEditToolPreview({ ...saved, auth_type: "custom_headers" }, saved).kind).toBe("incomplete");
+      expect(getEditToolPreview({ ...saved, auth_type: "custom_headers", custom_headers: rows }, saved).kind).toBe(
+        "preview",
+      );
+    });
+
+    it("does not reuse the stored headers on a new origin", () => {
+      expect(getEditToolPreview({ ...savedCustom, url: "https://other.example/mcp" }, savedCustom).kind).toBe(
+        "incomplete",
+      );
+    });
+
+    it("waits for a value on every row", () => {
+      expect(
+        getEditToolPreview({ ...savedCustom, custom_headers: [{ header: "DD-API-KEY", value: " " }] }, savedCustom)
+          .kind,
+      ).toBe("incomplete");
+    });
+  });
 });
