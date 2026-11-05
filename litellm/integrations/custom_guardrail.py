@@ -1103,8 +1103,12 @@ class CustomGuardrail(CustomLogger):
     ) -> LLMResponseTypes | None:
         """
         Allow modifying / reviewing the response just after it's received from the deployment.
+
+        A request the proxy stamped with ``proxy_server_request`` is left to
+        ``ProxyLogging.post_call_success_hook``, which runs model-level guardrails
+        on the final response; checking it here as well ran every guardrail twice.
         """
-        if not self.runs_post_call_deployment_hook(request_data):
+        if not self.runs_post_call_deployment_hook(request_data) or "proxy_server_request" in request_data:
             return None
 
         target: Final = self._deployment_hook_target()
