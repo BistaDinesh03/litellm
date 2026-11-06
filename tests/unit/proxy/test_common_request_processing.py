@@ -85,6 +85,9 @@ from litellm.proxy.hooks.model_max_budget_limiter import (
     team_member_budget_entity_id,
 )
 from litellm.proxy.utils import ProxyLogging
+from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.utils import GenericGuardrailAPIInputs
 from litellm.responses.mcp.parked_stream_dispatch import IN_FLIGHT_ROUND
 from litellm.router import Router
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
@@ -13088,3 +13091,144 @@ async def test_a_chained_proxy_redacts_secrets_and_internal_details_from_relayed
     assert {key: answered[key] for key in _DOWNSTREAM_GUARDRAIL_FIELDS} == dict(_DOWNSTREAM_GUARDRAIL_FIELDS)
     assert answered["scanner"]["attempts"] == 2
     assert [value for value in _DOWNSTREAM_LEAKABLE_VALUES if value in json.dumps(answered)] == []
+
+
+class _CountingPostCallGuardrail(CustomGuardrail):
+    """Like openai_moderation: only apply_guardrail, counting every provider call."""
+
+    def __init__(self) -> None:
+        super().__init__(guardrail_name="post-mod", event_hook=GuardrailEventHooks.post_call, default_on=False)
+        self.evaluations = 0
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: str,
+        logging_obj: object = None,
+    ) -> GenericGuardrailAPIInputs:
+        self.evaluations += 1
+        return inputs
+
+
+_GUARDED_ROUTES: Final = (
+    ("acompletion", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+    ("aresponses", "/v1/responses", {"input": "hi"}),
+    ("anthropic_messages", "/v1/messages", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32}),
+)
+_OPENAI_CHAT_REPLY: Final = {
+    "id": "chatcmpl-1",
+    "object": "chat.completion",
+    "created": 0,
+    "model": "gpt-4o",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+_OPENAI_CHAT_SSE: Final = (
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"gpt-4o",'
+    '"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"gpt-4o",'
+    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    "data: [DONE]\n\n"
+)
+_OPENAI_RESPONSES_REPLY: Final = {
+    "id": "resp_1",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "gpt-4o",
+    "output": [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi", "annotations": []}],
+        }
+    ],
+    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+}
+_OPENAI_RESPONSES_SSE: Final = (
+    f'data: {json.dumps({"type": "response.created", "sequence_number": 0, "response": {**_OPENAI_RESPONSES_REPLY, "status": "in_progress", "output": []}})}\n\n'
+    'data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"hi"}\n\n'
+    f'data: {json.dumps({"type": "response.completed", "sequence_number": 2, "response": _OPENAI_RESPONSES_REPLY})}\n\n'
+)
+
+
+def _openai_reply(json_reply: dict[str, object], sse_reply: str) -> Callable[[httpx.Request], httpx.Response]:
+    """JSON for a plain request, an SSE body when the request asked to stream."""
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse_reply.encode())
+        return httpx.Response(200, json=json_reply)
+
+    return reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize(("route_type", "path", "body"), _GUARDED_ROUTES, ids=[route for route, _, _ in _GUARDED_ROUTES])
+@pytest.mark.usefixtures("httpx_transport")
+async def test_a_model_level_post_call_guardrail_runs_once_per_proxy_request(
+    monkeypatch: pytest.MonkeyPatch, route_type: str, path: str, body: dict[str, object], stream: bool
+) -> None:
+    """LIT-10481: the deployment hook inside the SDK call and the proxy's post-call hook both saw a
+    guardrail attached through litellm_params.guardrails, so one request ran it twice."""
+    from litellm.proxy.proxy_server import ProxyConfig as RealProxyConfig
+    from litellm.proxy.proxy_server import select_data_generator
+
+    guardrail: Final = _CountingPostCallGuardrail()
+    monkeypatch.setattr(litellm, "callbacks", [guardrail])
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "guarded-model",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test", "guardrails": ["post-mod"]},
+            }
+        ]
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router, raising=False)
+    request: Final = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "scheme": "http",
+            "server": ("localhost", 4000),
+            "client": ("127.0.0.1", 12345),
+            "query_string": b"",
+            "headers": ((b"content-type", b"application/json"),),
+        }
+    )
+    processing_obj: Final = ProxyBaseLLMRequestProcessing(
+        data={"model": "guarded-model", **body, **({"stream": True} if stream else {})}
+    )
+
+    with respx.mock(assert_all_called=False) as provider:
+        provider.post("https://api.openai.com/v1/chat/completions").mock(
+            side_effect=_openai_reply(_OPENAI_CHAT_REPLY, _OPENAI_CHAT_SSE)
+        )
+        provider.post("https://api.openai.com/v1/responses").mock(
+            side_effect=_openai_reply(_OPENAI_RESPONSES_REPLY, _OPENAI_RESPONSES_SSE)
+        )
+        response: Final = await processing_obj.base_process_llm_request(
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="sk-test", request_route=path),
+            route_type=route_type,  # pyright: ignore[reportArgumentType]  # parametrized over the literal route names
+            proxy_logging_obj=ProxyLogging(user_api_key_cache=UserApiKeyCache()),
+            general_settings={},
+            proxy_config=RealProxyConfig(),
+            select_data_generator=select_data_generator,
+            llm_router=router,
+            is_streaming_request=stream,
+        )
+        if stream:
+            assert isinstance(response, StreamingResponse)
+            chunks: Final = [chunk async for chunk in response.body_iterator]
+            assert any(b"hi" in (chunk if isinstance(chunk, bytes) else chunk.encode()) for chunk in chunks), chunks
+        else:
+            assert "hi" in json.dumps(response if isinstance(response, dict) else response.model_dump())
+        await asyncio.sleep(0)
+    assert guardrail.evaluations == 1
