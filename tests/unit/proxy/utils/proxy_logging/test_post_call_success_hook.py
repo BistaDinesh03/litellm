@@ -97,6 +97,27 @@ async def test_blocking_model_level_post_call_guardrail_still_blocks_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_proxy_rechecks_a_response_rewritten_after_the_deployment_checked_it(
+    proxy_logging: ProxyLogging, monkeypatch: pytest.MonkeyPatch, parallel: bool
+) -> None:
+    """The deployment's check covers only the content it saw. A later hook that rewrites the
+    response (for example, unmasking PII) must not let the proxy skip the new content."""
+    guardrail: Final = _CountingModerationGuardrail(parallel=parallel)
+    monkeypatch.setattr(litellm, "callbacks", [guardrail])
+    response: Final = ModelResponse(choices=[{"message": {"role": "assistant", "content": "Hello"}}])
+    data: Final = _proxy_request("metadata", request_level=False)
+
+    await guardrail.async_post_call_success_deployment_hook(
+        request_data={**data, "guardrails": ["post-mod"]}, response=response, call_type=CallTypes.acompletion
+    )
+    rewritten: Final = ModelResponse(choices=[{"message": {"role": "assistant", "content": "Hello, rewritten"}}])
+    await proxy_logging.post_call_success_hook(data=data, response=rewritten, user_api_key_dict=UserAPIKeyAuth())
+
+    assert guardrail.evaluations == 2
+
+
+@pytest.mark.asyncio
 async def test_sdk_request_without_proxy_is_checked_at_the_deployment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Direct litellm.acompletion callers have no proxy hook, so the deployment hook must still run."""
     guardrail: Final = _CountingModerationGuardrail(parallel=False)
@@ -126,6 +147,7 @@ def _make_guardrail(name="g", should_run=True, override=None):
     cb.event_hook = GuardrailEventHooks.post_call
     cb.should_run_guardrail = MagicMock(return_value=should_run)
     cb.async_post_call_success_hook = AsyncMock(return_value=override)
+    cb.post_call_already_checked = MagicMock(return_value=False)
     cb.run_in_parallel = False
     return cb
 

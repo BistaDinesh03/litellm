@@ -13232,3 +13232,77 @@ async def test_a_model_level_post_call_guardrail_runs_once_per_proxy_request(
             assert "hi" in json.dumps(response if isinstance(response, dict) else response.model_dump())
         await asyncio.sleep(0)
     assert guardrail.evaluations == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("httpx_transport")
+async def test_a_post_call_guardrail_attached_only_to_the_fallback_deployment_runs_on_its_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback hop routes in a copy of the request metadata, so the proxy hook resolves guardrails
+    from the primary deployment. The fallback deployment's own guardrail must still check its response."""
+    from litellm.proxy.proxy_server import ProxyConfig as RealProxyConfig
+    from litellm.proxy.proxy_server import select_data_generator
+
+    guardrail: Final = _CountingPostCallGuardrail()
+    monkeypatch.setattr(litellm, "callbacks", [guardrail])
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "primary-model",
+                "litellm_params": {
+                    "model": "openai/gpt-4o",
+                    "api_key": "sk-test",
+                    "api_base": "https://primary.invalid/v1",
+                },
+            },
+            {
+                "model_name": "guarded-fallback",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-test", "guardrails": ["post-mod"]},
+            },
+        ],
+        fallbacks=[{"primary-model": ["guarded-fallback"]}],
+        num_retries=0,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router, raising=False)
+    path: Final = "/v1/chat/completions"
+    request: Final = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "scheme": "http",
+            "server": ("localhost", 4000),
+            "client": ("127.0.0.1", 12345),
+            "query_string": b"",
+            "headers": ((b"content-type", b"application/json"),),
+        }
+    )
+    processing_obj: Final = ProxyBaseLLMRequestProcessing(
+        data={"model": "primary-model", "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    with respx.mock(assert_all_called=False) as provider:
+        primary: Final = provider.post("https://primary.invalid/v1/chat/completions").mock(
+            return_value=httpx.Response(500, json={"error": {"message": "primary down"}})
+        )
+        provider.post("https://api.openai.com/v1/chat/completions").mock(
+            side_effect=_openai_reply(_OPENAI_CHAT_REPLY, _OPENAI_CHAT_SSE)
+        )
+        response: Final = await processing_obj.base_process_llm_request(
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="sk-test", request_route=path),
+            route_type="acompletion",
+            proxy_logging_obj=ProxyLogging(user_api_key_cache=UserApiKeyCache()),
+            general_settings={},
+            proxy_config=RealProxyConfig(),
+            select_data_generator=select_data_generator,
+            llm_router=router,
+            is_streaming_request=False,
+        )
+        await asyncio.sleep(0)
+
+    assert primary.called
+    assert "hi" in json.dumps(response if isinstance(response, dict) else response.model_dump())
+    assert guardrail.evaluations == 1

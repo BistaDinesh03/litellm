@@ -3091,39 +3091,6 @@ class TestCustomGuardrailPostCallSuccessDeploymentHook:
     VectorStorePreCallHook that attaches provider_specific_fields["search_results"])."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("style", ["apply_guardrail", "native_hook"])
-    async def test_proxy_request_leaves_post_call_to_the_proxy(self, style: str) -> None:
-        """LIT-10481: ProxyLogging.post_call_success_hook runs model-level guardrails on the
-        final response, so a request the proxy stamped with proxy_server_request must not also
-        be checked here, or the moderation provider is called twice."""
-        runs: Final[list[str]] = []
-
-        class NativeHookGuardrail(CustomGuardrail):
-            async def async_post_call_success_hook(self, data, user_api_key_dict, response):
-                runs.append("native")
-
-        if style == "apply_guardrail":
-            guardrail: CustomGuardrail = _ApplyStyleGuardrail(block=False)
-        else:
-            guardrail = NativeHookGuardrail(guardrail_name="native-guardrail")
-        guardrail.event_hook = GuardrailEventHooks.post_call
-        request_data: Final = {
-            "guardrails": [guardrail.guardrail_name],
-            "proxy_server_request": {"url": "http://localhost:4000/v1/chat/completions"},
-            "metadata": {},
-        }
-        response: Final = ModelResponse(choices=[Choices(message=Message(content="review me"))])
-
-        result: Final = await guardrail.async_post_call_success_deployment_hook(
-            request_data=request_data, response=response, call_type=CallTypes.acompletion
-        )
-
-        assert result is None
-        assert getattr(guardrail, "apply_called", False) is False
-        assert runs == []
-        assert "guardrail_to_apply" not in request_data
-
-    @pytest.mark.asyncio
     async def test_sdk_request_is_still_checked_at_the_deployment(self) -> None:
         guardrail: Final = _ApplyStyleGuardrail(block=False)
         guardrail.event_hook = GuardrailEventHooks.post_call

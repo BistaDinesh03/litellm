@@ -14,12 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import respx
+from fastapi import HTTPException
 from mcp.types import CallToolResult, ListToolsResult, TextContent
 from mcp.types import Tool as MCPTool
 
 # Import required modules
 import litellm
 from litellm.exceptions import GuardrailRaisedException, MidStreamFallbackError
+from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.langfuse.langfuse import langfuse_trace_id, langfuse_trace_metadata
 from litellm.litellm_core_utils.litellm_logging import Logging
@@ -35,7 +37,8 @@ from litellm.types.llms.openai import (
     ResponsesAPIStreamingResponse,
     ToolParam,
 )
-from litellm.types.utils import ModelResponse, StandardLoggingPayload, Usage
+from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.utils import GenericGuardrailAPIInputs, ModelResponse, StandardLoggingPayload, Usage
 
 
 class MockUserAPIKeyAuth:
@@ -3429,3 +3432,64 @@ async def test_bridged_stream_auto_execute_bills_nothing_for_a_round_served_from
     assert [(row["response_cost"], row["cache_hit"]) for row in both_cached.logged] == [(0.0, True)]
     assert client.usage is not None
     assert client.usage.cost == pytest.approx(_bridged_round_cost(470, 4))
+
+
+class _ToolCallBlockingGuardrail(CustomGuardrail):
+    """A model-level post_call tool policy: rejects any model output that asks for a tool call."""
+
+    def __init__(self) -> None:
+        super().__init__(guardrail_name="block-tool-calls", event_hook=GuardrailEventHooks.post_call, default_on=False)
+        self.seen_tool_calls: list[str] = []
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: str,
+        logging_obj: object = None,
+    ) -> GenericGuardrailAPIInputs:
+        tool_calls: Final = inputs.get("tool_calls") or []
+        if input_type == "response" and tool_calls:
+            self.seen_tool_calls.extend(str(call.get("function", {}).get("name")) for call in tool_calls)
+            raise HTTPException(status_code=400, detail={"error": "tool calls are not allowed"})
+        return inputs
+
+
+@pytest.mark.asyncio
+async def test_proxy_auto_execute_checks_the_first_round_before_running_its_tool_calls(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+):
+    """The proxy's post_call hook only sees the final response, after the tools already ran. The first
+    round's deployment hook is the only check that can stop a tool call the model asked for."""
+    _serve_rounds(respx_mock, monkeypatch, (_ROUND_ONE_BODY, _ROUND_TWO_BODY))
+    guardrail: Final = _ToolCallBlockingGuardrail()
+    monkeypatch.setattr(litellm, "callbacks", [guardrail])
+    executed: Final = AsyncMock(return_value=[{"tool_call_id": "call_echo", "result": "PING", "name": "echo"}])
+    echo_tool: Final = MCPTool.model_validate(
+        {"name": "echo", "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}}},
+        by_name=False,
+    )
+
+    with (
+        patch.object(
+            LiteLLM_Proxy_MCP_Handler,
+            "process_mcp_tools_without_openai_transform",
+            AsyncMock(return_value=([echo_tool], {"echo": "demo"})),
+        ),
+        patch.object(LiteLLM_Proxy_MCP_Handler, "execute_tool_calls", executed),
+        pytest.raises(HTTPException) as blocked,
+    ):
+        await litellm.aresponses(
+            model="openai/gpt-5.6",
+            input="Call echo with PING",
+            tools=[dict(_ECHO_MCP_TOOL)],
+            api_key="sk-mcp-rounds",
+            api_base="https://mcp-rounds.example.com/v1",
+            guardrails=["block-tool-calls"],
+            proxy_server_request={"url": "http://localhost:4000/v1/responses", "method": "POST"},
+            litellm_metadata={"user_api_key_request_route": "/v1/responses"},
+        )
+
+    assert blocked.value.status_code == 400
+    assert guardrail.seen_tool_calls == ["echo"]
+    executed.assert_not_awaited()

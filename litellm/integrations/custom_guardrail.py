@@ -1,6 +1,7 @@
 import contextvars
 import copy
 import hashlib
+import json
 import os
 import secrets
 from collections.abc import Iterable, Mapping, Sequence
@@ -10,7 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Optional, cast, get_args
 
 import httpx
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from litellm._internal_context import with_service_target
 from litellm._logging import verbose_logger
@@ -73,6 +74,7 @@ GUARDRAIL_SESSIONS_TARGET: Final = "guardrail_sessions"
 _PRE_CALL_EXECUTED_TOKEN: Final = secrets.token_hex(16)
 _PRE_CALL_RAISED_TOKEN: Final = secrets.token_hex(16)
 _DEPLOYMENT_HOOK_RAN_TOKEN: Final = secrets.token_hex(16)
+_POST_CALL_CHECKED_TOKEN: Final = secrets.token_hex(16)
 
 _GUARDRAIL_BLOCK_STATUS_CODES: Final = frozenset({400, 403, 422})
 
@@ -279,6 +281,46 @@ def _request_carries_marker(data: Mapping[str, object], marker: str | None) -> b
             if isinstance(executed, list) and marker in executed:
                 return True
     return False
+
+
+def _write_marker(
+    data: dict[str, object],  # mutable-ok: the request payload the marker is recorded on
+    marker: str | None,
+) -> None:
+    if marker is None:
+        return
+    for meta_key in ("metadata", "litellm_metadata"):
+        meta = data.get(meta_key)
+        if isinstance(meta, dict):
+            executed = meta.get(PRE_CALL_EXECUTED_GUARDRAILS_KEY)
+            if isinstance(executed, list):
+                if marker not in executed:
+                    executed.append(marker)
+            else:
+                meta[PRE_CALL_EXECUTED_GUARDRAILS_KEY] = [marker]
+            return
+    data["metadata"] = {PRE_CALL_EXECUTED_GUARDRAILS_KEY: [marker]}
+
+
+_RESPONSE_FIELDS: Final = TypeAdapter(dict[str, object])
+
+
+def _response_content(response: object) -> object:
+    if isinstance(response, BaseModel):
+        return response.model_dump(mode="json")
+    if isinstance(response, dict):
+        fields: Final = _RESPONSE_FIELDS.validate_python(response)
+        return {key: value for key, value in fields.items() if not key.startswith("_")}
+    return response
+
+
+def _response_fingerprint(response: object) -> str | None:
+    payload: Final = _response_content(response)
+    try:
+        dumped: Final = json.dumps(payload, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(dumped.encode()).hexdigest()
 
 
 _REQUEST_FIELDS: Final = TypeAdapter(Mapping[str, object])
@@ -912,20 +954,7 @@ class CustomGuardrail(CustomLogger):
         With ``raised``, records instead that the hook raised as a policy pipeline
         step the pipeline then moved past. The deployment-level hook still runs it.
         """
-        marker: Final = self._pre_call_marker(raised=raised)
-        if marker is None:
-            return
-        for meta_key in ("metadata", "litellm_metadata"):
-            meta = data.get(meta_key)
-            if isinstance(meta, dict):
-                executed = meta.get(PRE_CALL_EXECUTED_GUARDRAILS_KEY)
-                if isinstance(executed, list):
-                    if marker not in executed:
-                        executed.append(marker)
-                else:
-                    meta[PRE_CALL_EXECUTED_GUARDRAILS_KEY] = [marker]
-                return
-        data["metadata"] = {PRE_CALL_EXECUTED_GUARDRAILS_KEY: [marker]}
+        _write_marker(data, self._pre_call_marker(raised=raised))
 
     def pre_call_hook_ran_or_raised(self, data: Mapping[str, object]) -> bool:
         """Whether this guardrail's ``async_pre_call_hook`` ran for this request, whatever it decided."""
@@ -1103,12 +1132,8 @@ class CustomGuardrail(CustomLogger):
     ) -> LLMResponseTypes | None:
         """
         Allow modifying / reviewing the response just after it's received from the deployment.
-
-        A request the proxy stamped with ``proxy_server_request`` is left to
-        ``ProxyLogging.post_call_success_hook``, which runs model-level guardrails
-        on the final response; checking it here as well ran every guardrail twice.
         """
-        if not self.runs_post_call_deployment_hook(request_data) or "proxy_server_request" in request_data:
+        if not self.runs_post_call_deployment_hook(request_data):
             return None
 
         target: Final = self._deployment_hook_target()
@@ -1127,10 +1152,21 @@ class CustomGuardrail(CustomLogger):
                 cast("dict[str, object]", request_data)  # cast-ok: proxy request payloads are str-keyed
             )
 
-        if not self._is_valid_response_type(result):
-            return None
+        returned: Final = result if self._is_valid_response_type(result) else None
+        if target is not self:
+            _write_marker(
+                cast("dict[str, object]", request_data),  # cast-ok: proxy request payloads are str-keyed
+                self._post_call_check_marker(returned if returned is not None else response),
+            )
+        return returned
 
-        return result
+    def _post_call_check_marker(self, response: object) -> str | None:
+        fingerprint: Final = _response_fingerprint(response)
+        return self._marker(f"{_POST_CALL_CHECKED_TOKEN}:{fingerprint}") if fingerprint is not None else None
+
+    def post_call_already_checked(self, data: Mapping[str, object], response: object) -> bool:
+        """Whether a deployment-level hook of this request already ran this guardrail on this exact response."""
+        return _request_carries_marker(data, self._post_call_check_marker(response))
 
     async def async_logging_hook(
         self,
